@@ -1,0 +1,770 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-8416, -1344],
+      "id": "3243b308-8cc4-4e1a-8fa1-9b2267be8703",
+      "name": "00 Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Concurrency Guard ──\n// Passes a run timestamp downstream.\n// Real concurrency locking should use a dedicated lock row in Sheets\n// or an external KV store (Redis). For now, 'Processing' status filter\n// in node 01 prevents re-picking in-flight rows.\nconst now = Date.now();\nreturn [{ json: { _run_start: now, _workflow_version: 'v5_stable' } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-8128, -1200],
+      "id": "c3966624-1370-4909-bd98-a7e9a47c86b6",
+      "name": "00b Concurrency Guard"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "YOUR_SPREADSHEET_NAME",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "YOUR_SHEET_GID",
+          "mode": "list",
+          "cachedResultName": "Content Requests",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit#gid=YOUR_SHEET_GID"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "Status",
+              "lookupValue": "=Pending"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [-7888, -1200],
+      "id": "23d03258-e623-47f3-a2f6-7af924c48fbe",
+      "name": "01 Read Pending Rows",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json['Primary Keyword'] }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              },
+              "id": "a731fc9d-0782-4b25-955b-afb596d97465"
+            },
+            {
+              "leftValue": "={{ $json.row_number }}",
+              "rightValue": 1,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              },
+              "id": "b832fe0e-1234-5678-abcd-efgh12345678"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [-7328, -1184],
+      "id": "a15255d3-1f4c-4560-865f-ae1bc5b1ff73",
+      "name": "02 Has Valid Row?"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ── Normalize + Validate Input ──\n// CRITICAL: row_number is LOCKED here from Google Sheets native field.\n// Never reconstruct or recalculate row_number downstream.\n\nconst item = $input.item.json;\n\nconst validSectionTypes = ['intro','accordion','faq','comparison','blog_post'];\nconst validFormats      = ['plain_text','json','markdown','html','wordpress_html'];\nconst validVoices       = ['professional','friendly','luxury','casual','authoritative'];\n\nfunction norm(v, fallback) {\n  return ((v ?? '').toString().toLowerCase().trim().replace(/[\\s\\-]+/g,'_')) || fallback;\n}\n\nfunction safeJson(val, fallback) {\n  if (!val) return fallback;\n  if (Array.isArray(val)) return val;\n  if (typeof val === 'object' && val !== null) return Object.values(val);\n  try { return JSON.parse(val); } catch {}\n  return String(val).split(',').map(s => s.trim()).filter(Boolean);\n}\n\nfunction safeInt(val, fallback, min) {\n  const n = parseInt(val);\n  return isNaN(n) ? fallback : Math.max(min ?? 0, n);\n}\n\nfunction safeStr(val, fallback) {\n  return ((val ?? '').toString().trim()) || fallback;\n}\n\nconst langMap = {\n  english:'en', spanish:'es', french:'fr', german:'de', italian:'it',\n  portuguese:'pt', dutch:'nl', arabic:'ar', japanese:'ja', chinese:'zh',\n  korean:'ko', russian:'ru', turkish:'tr', polish:'pl', hindi:'hi',\n  hebrew:'he'\n};\n\n// ── LOCK row_number from Google Sheets ──\nconst rawRowNumber = item.row_number;\nconst rowNumber = typeof rawRowNumber === 'number'\n  ? rawRowNumber\n  : parseInt(rawRowNumber);\n\nif (!rowNumber || isNaN(rowNumber) || rowNumber < 2) {\n  throw new Error(\n    `row_number invalid: got \"${rawRowNumber}\" (type: ${typeof rawRowNumber}). ` +\n    `Google Sheets node must return row_number >= 2. ` +\n    `Ensure the Sheets node has row_number enabled and Execute Once is OFF.`\n  );\n}\n\nconst sectionType = norm(item['Section Type'] || item['Page Type'], 'intro');\nconst language    = safeStr(item['Language'], 'English');\nconst langCode    = langMap[language.toLowerCase()] || 'en';\nconst outputFmt   = norm(item['Output Format'], 'markdown');\nconst brandVoice  = norm(item['Brand Voice'], 'professional');\n\nreturn {\n  json: {\n    row_number:           rowNumber,\n    row_id:               `row_${rowNumber}_${Date.now()}`,\n    primary_keyword:      safeStr(item['Primary Keyword'], ''),\n    page_type:            safeStr(item['Page Type'], ''),\n    section_type:         validSectionTypes.includes(sectionType) ? sectionType : 'intro',\n    word_count:           safeInt(item['Word Count'], 300, 50),\n    keyword_count:        safeInt(item['Keyword Count'], 5, 1),\n    min_keywords:         safeInt(item['Min Keywords Required'], 3, 1),\n    language:             language,\n    language_code:        langCode,\n    country:              safeStr(item['Country / Location'] || item['Country'], 'United States'),\n    topic_context:        safeStr(item['Topic Context'], ''),\n    target_audience:      safeStr(item['Target Audience'], 'general audience'),\n    content_goal:         safeStr(item['Content Goal'], 'inform readers'),\n    required_topics:      safeJson(item['Required Topics'], []),\n    forbidden_topics:     safeJson(item['Forbidden Topics'], []),\n    brand_voice:          validVoices.includes(brandVoice) ? brandVoice : 'professional',\n    brand_voice_example:  safeStr(item['Brand Voice Example'], ''),\n    output_format:        validFormats.includes(outputFmt) ? outputFmt : 'markdown',\n    existing_page_url:    safeStr(item['Existing Page URL'], ''),\n    existing_page_text:   safeStr(item['Existing Page Content / Summary'], ''),\n    existing_page_scraped: '',\n    _scrape_source: 'pending',\n    _phase: 'normalized'\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-7072, -1184],
+      "id": "6071c640-f354-47e7-8bb4-57dd67096927",
+      "name": "03 Normalize + Validate Input"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "YOUR_SPREADSHEET_NAME",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "YOUR_SHEET_GID",
+          "mode": "list",
+          "cachedResultName": "Content Requests",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit#gid=YOUR_SHEET_GID"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $json.row_number }}",
+            "Status": "Processing"
+          },
+          "matchingColumns": ["row_number"],
+          "schema": [
+            {"id": "Primary Keyword","displayName": "Primary Keyword","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Page Type","displayName": "Page Type","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Section Type","displayName": "Section Type","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Word Count","displayName": "Word Count","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Keyword Count","displayName": "Keyword Count","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Min Keywords Required","displayName": "Min Keywords Required","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Language","displayName": "Language","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Country / Location","displayName": "Country / Location","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Topic Context","displayName": "Topic Context","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Target Audience","displayName": "Target Audience","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Content Goal","displayName": "Content Goal","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Required Topics","displayName": "Required Topics","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Forbidden Topics","displayName": "Forbidden Topics","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Brand Voice","displayName": "Brand Voice","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Brand Voice Example","displayName": "Brand Voice Example","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Output Format","displayName": "Output Format","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Existing Page URL","displayName": "Existing Page URL","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Existing Page Content / Summary","displayName": "Existing Page Content / Summary","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Status","displayName": "Status","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Selected Keywords","displayName": "Selected Keywords","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Keyword Mapping by Section","displayName": "Keyword Mapping by Section","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Excluded Keywords","displayName": "Excluded Keywords","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Search Intent","displayName": "Search Intent","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Confidence Score","displayName": "Confidence Score","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Keyword Selection Reason","displayName": "Keyword Selection Reason","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Content Brief","displayName": "Content Brief","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Final Output","displayName": "Final Output","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Meta Title","displayName": "Meta Title","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Meta Description","displayName": "Meta Description","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Suggested Slug","displayName": "Suggested Slug","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Quality Check Result","displayName": "Quality Check Result","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Needs Review Reason","displayName": "Needs Review Reason","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "row_number","displayName": "row_number","required": false,"defaultMatch": false,"display": true,"type": "number","canBeUsedToMatch": true,"readOnly": true,"removed": false}
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [-6848, -1184],
+      "id": "11363502-39b4-44bf-9b58-f8399c14ff89",
+      "name": "04 Mark Processing",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "executeOnce": false,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ── Pass-through after Mark Processing ──\nconst normalized = $('03 Normalize + Validate Input').item.json;\nreturn { json: { ...normalized, _phase: 'marked_processing' } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-6592, -1184],
+      "id": "c122ed4e-b0fe-46d1-84c3-8057d7e83f4b",
+      "name": "04b Restore After Mark"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true,"leftValue": "","typeValidation": "strict","version": 2},
+          "conditions": [{"leftValue": "={{ $json.existing_page_url }}","rightValue": "","operator": {"type": "string","operation": "notEmpty"},"id": "e6729869-6041-4cee-851c-5fc7dbd29dc6"}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-6352, -1184],
+      "id": "48e9329c-de94-4219-b591-dc66d6b5e085",
+      "name": "05 Has Existing Page URL?"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.existing_page_url }}",
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "response": {"response": {"responseFormat": "text"}},
+          "timeout": 15000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-6128, -1312],
+      "id": "bb7be358-355e-4c74-b762-f6b8fb8f02db",
+      "name": "06 Fetch Existing Page",
+      "retryOnFail": false,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ── Extract Page Text (TRUE branch) ──\nconst normalized = $('03 Normalize + Validate Input').item.json;\nconst httpOut    = $input.item.json;\n\nconst isError = !!(\n  httpOut?.error ||\n  (typeof httpOut?.statusCode === 'number' && httpOut.statusCode >= 400)\n);\n\nlet scrapedText = '';\n\nif (!isError) {\n  try {\n    const raw = httpOut?.data\n      || httpOut?.body\n      || httpOut?.response?.body\n      || httpOut?.text\n      || (typeof httpOut === 'string' ? httpOut : '');\n\n    const rawStr = typeof raw === 'string' ? raw : JSON.stringify(raw);\n\n    scrapedText = rawStr\n      .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n      .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n      .replace(/<noscript[\\s\\S]*?<\\/noscript>/gi, ' ')\n      .replace(/<!--[\\s\\S]*?-->/g, ' ')\n      .replace(/<[^>]+>/g, ' ')\n      .replace(/\\s+/g, ' ')\n      .trim()\n      .slice(0, 6000);\n  } catch (e) {\n    scrapedText = '';\n  }\n}\n\nconst hasGoodScrape = scrapedText && scrapedText.length > 50;\nconst finalText     = hasGoodScrape\n  ? scrapedText\n  : (normalized.existing_page_text || '');\n\nconst scrapeSource = isError\n  ? 'http_error'\n  : hasGoodScrape\n    ? 'scraped'\n    : 'fallback_empty_response';\n\nreturn {\n  json: {\n    ...normalized,\n    existing_page_scraped: finalText,\n    _scrape_source: scrapeSource,\n    _scrape_error:  isError ? (httpOut?.error || `HTTP ${httpOut?.statusCode}`) : null,\n    _phase: 'enriched'\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-5888, -1312],
+      "id": "bdbcc26f-48d2-4f1c-bfd1-6a5ecd1717b8",
+      "name": "07 Extract Page Text"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const normalized = $('03 Normalize + Validate Input').item.json;\n\nreturn {\n  json: {\n    ...normalized,\n    existing_page_scraped: normalized.existing_page_text || '',\n    _scrape_source: 'no_url',\n    _scrape_error: null,\n    _phase: 'enriched'\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-6032, -1072],
+      "id": "4387decc-3b15-4c53-97b6-215edd5745e3",
+      "name": "05b No URL — Use Existing Text"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [-5648, -1200],
+      "id": "626c9619-a1d1-4068-80f0-769572243047",
+      "name": "08 Merge URL Branches"
+    },
+    {
+      "parameters": {
+        "operation": "get-live-google-keywords-for-keywords",
+        "keywords_for_keywords": {"values": [{"value": "={{ $json.primary_keyword }}"}]},
+        "location_name": "={{ $json.country }}",
+        "language_name": "={{ $json.language }}",
+        "date_from": {},
+        "date_to": {},
+        "sort_by": "search_volume"
+      },
+      "type": "n8n-nodes-dataforseo.dataForSeoKeywordsApi",
+      "typeVersion": 1,
+      "position": [-5184, -1488],
+      "id": "0dee58df-9ae9-453a-95da-b1d330155963",
+      "name": "09 DFS Related Keywords",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 4000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true,"leftValue": "","typeValidation": "strict","version": 3},
+          "conditions": [{"id": "16454ccd-d3ad-4f76-9271-50d8a55b8a96","leftValue": "={{ ['faq','blog_post'].includes(($json.section_type || '').toLowerCase()) }}","rightValue": "FAQ","operator": {"type": "boolean","operation": "true","singleValue": true}}],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [-5456, -1008],
+      "id": "3b35ab1d-94eb-450e-a6d5-354a188d3149",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "operation": "get-google-organic-serp-regular",
+        "keyword": "={{ $json.primary_keyword }}",
+        "location_name": "={{ $json.country }}",
+        "language_name": "={{ $json.language }}",
+        "max_crawl_pages": {},
+        "browser_screen_width": {},
+        "browser_screen_height": {},
+        "browser_screen_resolution_ratio": {},
+        "people_also_ask_click_depth": {}
+      },
+      "type": "n8n-nodes-dataforseo.dataForSeoSerpApi",
+      "typeVersion": 1,
+      "position": [-5232, -1136],
+      "id": "5df4969d-ebc0-4797-80b9-57c808d94904",
+      "name": "11 DFS SERP + PAA",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const items =\n$json.tasks?.[0]?.result?.[0]?.items || [];\n\nconst organic = items\n.filter(i => i.type === 'organic')\n.slice(0,5)\n.map(i => ({\n  title: i.title,\n  domain: i.domain\n}));\n\nconst paa = items\n.filter(i => i.type === 'people_also_ask')\n.slice(0,5)\n.map(i => i.title);\n\nreturn [{\n  json:{\n    serp_organic: organic,\n    people_also_ask: paa\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-5024, -1136],
+      "id": "2599f8f8-ced1-432b-8786-8720855f9f24",
+      "name": "11b Parse SERP"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [-4816, -1184],
+      "id": "fc778b95-2551-4881-9eae-09601c0909af",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "function extractKeywords(nodeOutput) {\n  const kws = [];\n  if (!nodeOutput || typeof nodeOutput !== 'object') return kws;\n\n  for (const task of (nodeOutput?.tasks || [])) {\n    for (const result of (task?.result || [])) {\n      for (const kw of (result?.items || [])) {\n        if (!kw?.keyword || typeof kw.keyword !== 'string') continue;\n        const kwStr = kw.keyword.trim();\n        if (!kwStr || kwStr.length > 120) continue;\n        kws.push({\n          keyword:       kwStr,\n          search_volume: kw.search_volume ?? kw.keyword_info?.search_volume ?? null,\n          competition:   kw.competition ?? kw.keyword_info?.competition_level ?? null,\n          cpc:           kw.cpc ?? kw.keyword_info?.cpc ?? null,\n          intent:        kw.search_intent_info?.main_intent ?? kw.intent ?? 'informational',\n          is_fallback:   false\n        });\n      }\n    }\n  }\n\n  if (kws.length === 0 && nodeOutput?._flat && Array.isArray(nodeOutput?._items)) {\n    for (const kw of nodeOutput._items) {\n      if (!kw?.keyword || typeof kw.keyword !== 'string') continue;\n      const kwStr = kw.keyword.trim();\n      if (!kwStr || kwStr.length > 120) continue;\n      kws.push({\n        keyword:       kwStr,\n        search_volume: kw.search_volume ?? kw.keyword_info?.search_volume ?? null,\n        competition:   kw.competition ?? kw.keyword_info?.competition_level ?? null,\n        cpc:           kw.cpc ?? kw.keyword_info?.cpc ?? null,\n        intent:        kw.search_intent_info?.main_intent ?? kw.intent ?? 'informational',\n        is_fallback:   false\n      });\n    }\n  }\n\n  return kws;\n}\n\nconst inputData = $('08 Merge URL Branches').item.json;\n\nif (!inputData?.row_number || !inputData?.primary_keyword) {\n  throw new Error('Node 12: Cannot read inputData from Node 08. row_number or primary_keyword missing.');\n}\n\nlet serpData = {\n  serp_organic: [],\n  people_also_ask: [],\n  top_competitors: []\n};\n\ntry {\n  const parsedSerp = $('11b Parse SERP').item.json;\n  serpData = {\n    serp_organic: Array.isArray(parsedSerp?.serp_organic) ? parsedSerp.serp_organic : [],\n    people_also_ask: Array.isArray(parsedSerp?.people_also_ask) ? parsedSerp.people_also_ask : [],\n    top_competitors: Array.isArray(parsedSerp?.top_competitors) ? parsedSerp.top_competitors : []\n  };\n} catch (e) {}\n\nlet relatedRaw = {};\ntry {\n  const items = $('09 DFS Related Keywords').all();\n  if (items.length) {\n    const raw = items[0].json;\n    if (raw?.tasks) {\n      relatedRaw = raw;\n    } else if (Array.isArray(raw?.result)) {\n      relatedRaw = { tasks: [{ result: raw.result }] };\n    } else {\n      const allItems = items.map(i => i.json).filter(Boolean);\n      relatedRaw = { _flat: true, _items: allItems };\n    }\n  }\n} catch(e) {}\n\nconst relatedKws = extractKeywords(relatedRaw);\n\nconst kwMap = new Map();\nfor (const kw of relatedKws) {\n  const key = kw.keyword.toLowerCase();\n  if (!kwMap.has(key)) kwMap.set(key, kw);\n}\n\nlet allKeywords = Array.from(kwMap.values());\nallKeywords.sort((a, b) => (b.search_volume || 0) - (a.search_volume || 0));\n\nconst minRequired = inputData.min_keywords || 3;\nconst pk = inputData.primary_keyword || 'travel';\n\nif (allKeywords.length < minRequired) {\n  const templates = [\n    `best ${pk}`,`${pk} guide`,`${pk} tips`,`how to plan ${pk}`,`${pk} for beginners`,\n    `${pk} cost`,`${pk} review`,`best time for ${pk}`,`${pk} for families`,`${pk} for couples`,\n    `affordable ${pk}`,`top ${pk}`,`${pk} comparison`,`${pk} recommendations`,\n    `${pk} pros and cons`,`${pk} checklist`,`${pk} 2025`,`why visit ${pk}`,\n    `complete ${pk} guide`,`${pk} travel tips`\n  ];\n\n  for (const t of templates) {\n    const key = t.toLowerCase();\n    if (!kwMap.has(key)) {\n      allKeywords.push({ keyword: t, search_volume: null, competition: null, cpc: null, intent: 'informational', is_fallback: true });\n      kwMap.set(key, true);\n    }\n    if (allKeywords.filter(k => k.is_fallback).length >= 20) break;\n  }\n}\n\nconst intentGroups = { informational: [], commercial: [], transactional: [], navigational: [] };\nfor (const kw of allKeywords) {\n  const intent = (kw.intent || 'informational').toLowerCase();\n  if (intentGroups[intent]) intentGroups[intent].push(kw.keyword);\n  else intentGroups.informational.push(kw.keyword);\n}\n\nconst qPrefixes = new Set(['how','what','why','when','where','which','who','is','are','can','do','does','should']);\nconst questionKeywords = allKeywords.filter(kw => qPrefixes.has((kw.keyword.split(' ')[0] || '').toLowerCase())).map(kw => kw.keyword);\n\nconst coverageStats = {\n  related_count: relatedKws.length,\n  total_deduped: allKeywords.filter(k => !k.is_fallback).length,\n  fallback_count: allKeywords.filter(k => k.is_fallback).length,\n  fallback_applied: allKeywords.some(k => k.is_fallback),\n  dfs_got_data: relatedKws.length > 0\n};\n\nreturn [{\n  json: {\n    ...inputData,\n    keyword_research: {\n      all_keywords: allKeywords,\n      total_count: allKeywords.length,\n      intent_groups: intentGroups,\n      question_keywords: questionKeywords,\n      question_clusters: {},\n      serp_organic: serpData.serp_organic,\n      people_also_ask: serpData.people_also_ask,\n      top_competitors: serpData.top_competitors,\n      coverage_stats: {\n        ...coverageStats,\n        serp_count: serpData.serp_organic.length,\n        paa_count: serpData.people_also_ask.length,\n        competitor_count: serpData.top_competitors.length\n      }\n    },\n    _phase: 'keywords_aggregated'\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4624, -1152],
+      "id": "ab44be2c-b531-470d-a7cc-e46ca7a7fffd",
+      "name": "12 Aggregate + Cluster + Fallback"
+    },
+    {
+      "parameters": {
+        "modelId": {"__rl": true,"value": "gpt-4o","mode": "id"},
+        "responses": {
+          "values": [
+            {
+              "content": "=={{ `\nYou are an expert SEO keyword strategist working on content for a ${$json.country || 'global'} audience.\n\nYour job is to analyze the provided keyword set and return a structured JSON output with confidence scoring.\n\n═══════════════════════════════════\nCONTENT BRIEF\n═══════════════════════════════════\nPrimary Keyword   : ${$json.primary_keyword}\nPage Type         : ${$json.page_type || ''}\nSection Type      : ${$json.section_type || ''}\nContent Goal      : ${$json.content_goal || ''}\nTarget Audience   : ${$json.target_audience || ''}\nLanguage          : ${$json.language || 'English'}\nWord Count Target : ${$json.word_count || ''}\nMinimum Keywords Required: ${$json.min_keywords || 12}\n\nTopic Context:\n${$json.topic_context || ''}\n\n═══════════════════════════════════\nKEYWORD DATA\n═══════════════════════════════════\nRelated Keywords (with metrics):\n${$('12 Aggregate + Cluster + Fallback').item.json.keyword_research.all_keywords.map(k => `- ${k.keyword} [vol: ${k.search_volume ?? 'unknown'}, intent: ${k.intent || 'informational'}, cpc: ${k.cpc ?? 'n/a'}, fallback: ${k.is_fallback}]`).join('\\n')}\n\nQuestion Keywords:\n${$('12 Aggregate + Cluster + Fallback').item.json.keyword_research.question_keywords.slice(0, 15).join(', ')}\n\nIntent Groups:\n${JSON.stringify($('12 Aggregate + Cluster + Fallback').item.json.keyword_research.intent_groups)}\n\nRequired Topics : ${JSON.stringify($json.required_topics || [])}\nForbidden Topics: ${JSON.stringify($json.forbidden_topics || [])}\n\nPeople Also Ask:\n${JSON.stringify($('12 Aggregate + Cluster + Fallback').item.json.keyword_research.people_also_ask || [])}\n\nTop Competitors:\n${JSON.stringify($('12 Aggregate + Cluster + Fallback').item.json.keyword_research.top_competitors || [])}\n\nSERP Organic Results:\n${JSON.stringify($('12 Aggregate + Cluster + Fallback').item.json.keyword_research.serp_organic || [])}\n\n\n═══════════════════════════════════\nSELECTION RULES\n═══════════════════════════════════\n- You MUST select a minimum of ${$json.min_keywords || 12} keywords — this is mandatory\n- Maximum: 25 keywords\n- Prefer keywords with known search volume over fallback keywords\n- Include question keywords that match the section intent\n- Exclude forbidden topics and irrelevant keywords\n- Every selected keyword MUST be an object with all required fields\n- Use People Also Ask data when selecting FAQ-related keywords\n- Use SERP Organic Results to validate keyword relevance\n- Use Top Competitors only as supporting evidence, not as primary keyword sources\n\n═══════════════════════════════════\nKEYWORD MAPPING RULES — READ CAREFULLY\n═══════════════════════════════════\nSection Type is: ${$json.section_type || 'intro'}\n\n${$json.section_type === 'accordion' ? `\nSince section_type = accordion, keyword_mapping_by_section MUST use this exact nested structure:\n{\n  \"overview.why_visit\":    { \"keywords\": [\"kw1\", \"kw2\"], \"intent\": \"informational\" },\n  \"overview.best_for\":     { \"keywords\": [\"kw3\"],        \"intent\": \"commercial\" },\n  \"overview.where_to_stay\":{ \"keywords\": [\"kw4\", \"kw5\"], \"intent\": \"commercial\" },\n  \"things_to_do.top_attractions\":   { \"keywords\": [\"kw6\"], \"intent\": \"informational\" },\n  \"things_to_do.nature_and_outdoors\":{ \"keywords\": [\"kw7\"], \"intent\": \"informational\" },\n  \"things_to_do.food_and_nightlife\": { \"keywords\": [\"kw8\"], \"intent\": \"informational\" },\n  \"trip_planning.best_time_to_visit\":{ \"keywords\": [\"kw9\"], \"intent\": \"informational\" },\n  \"trip_planning.getting_around\":    { \"keywords\": [\"kw10\"],\"intent\": \"informational\" },\n  \"trip_planning.budget_and_costs\":  { \"keywords\": [\"kw11\"],\"intent\": \"commercial\" }\n}\n` : $json.section_type === 'faq' ? `\nSince section_type = faq, keyword_mapping_by_section MUST use this structure:\n{\n  \"faq_questions\": [\"question-style keyword1\", \"question-style keyword2\"],\n  \"supporting\":    [\"supporting keyword1\", \"supporting keyword2\"]\n}\n` : $json.section_type === 'comparison' ? `\nSince section_type = comparison, keyword_mapping_by_section MUST use this structure:\n{\n  \"best_for\":       [\"keyword1\", \"keyword2\"],\n  \"hotels_resorts\": [\"keyword3\"],\n  \"cost_value\":     [\"keyword4\", \"keyword5\"],\n  \"things_to_do\":   [\"keyword6\"],\n  \"overall_vibe\":   [\"keyword7\", \"keyword8\"]\n}\n` : $json.section_type === 'blog_post' ? `\nSince section_type = blog_post, keyword_mapping_by_section MUST use this structure:\n{\n  \"title\":       [\"keyword1\"],\n  \"intro\":       [\"keyword2\", \"keyword3\"],\n  \"section_1\":   [\"keyword4\", \"keyword5\"],\n  \"section_2\":   [\"keyword6\", \"keyword7\"],\n  \"section_3\":   [\"keyword8\"],\n  \"faq\":         [\"keyword9\", \"keyword10\"],\n  \"conclusion\":  [\"keyword11\"]\n}\n` : `\nSince section_type = intro, keyword_mapping_by_section MUST use this structure:\n{\n  \"opening\":    [\"keyword1\", \"keyword2\"],\n  \"main_body\":  [\"keyword3\", \"keyword4\", \"keyword5\"],\n  \"closing\":    [\"keyword6\"]\n}\n`}\n\n═══════════════════════════════════\nCONFIDENCE SCORING RULES\n═══════════════════════════════════\nStart at 85 as baseline. Then adjust:\n\n+10 → 8+ keywords have known search volume\n+5  → keyword intent strongly matches section type\n-5  → fewer than min_keywords selected\n-10 → more than half keywords are fallback\n-15 → keywords weakly related to primary keyword\n-20 → forbidden topic detected in selected keywords\n\nIMPORTANT:\n- If you selected ${$json.min_keywords || 12} or more keywords → score MUST be 80 or above\n- Never score below 80 unless keywords are genuinely irrelevant\n- Be generous — a usable keyword set deserves a high score\n\n═══════════════════════════════════\nOUTPUT FORMAT\n═══════════════════════════════════\nReturn ONLY valid JSON. No explanation. No markdown. No backticks.\n\n{\n  \"selected_keywords\": [\n    {\n      \"keyword\": \"exact keyword string\",\n      \"search_volume\": null,\n      \"competition\": null,\n      \"cpc\": null,\n      \"intent\": \"informational\",\n      \"is_fallback\": false,\n      \"relevance_reason\": \"one sentence why selected\"\n    }\n  ],\n  \"keyword_mapping_by_section\": {},\n  \"selected_questions\": [\"question1\", \"question2\"],\n  \"excluded_keywords\": [\"excluded1\"],\n  \"search_intent\": \"informational\",\n  \"confidence_score\": 85,\n  \"keyword_selection_reason\": \"detailed explanation\",\n  \"reason\": \"brief one-line summary\"\n}\n` }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {"maxTokens": 4500,"temperature": 0.15}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [-4416, -1120],
+      "id": "141d9fa8-27df-4dd1-8175-617dea43c731",
+      "name": "13 LLM Keyword Decision + Deep Mapping",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Parse + Validate LLM Keyword Decision ──\n\nconst inputData = $('12 Aggregate + Cluster + Fallback').item.json;\nconst allAvailableKeywords = inputData.keyword_research?.all_keywords || [];\nconst totalAvailable = allAvailableKeywords.length;\nconst minKw = inputData.min_keywords || 3;\n\nfunction extractJson(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('Empty LLM output');\n  let cleaned = raw.trim()\n    .replace(/^```json\\s*/i, '')\n    .replace(/^```\\s*/i, '')\n    .replace(/\\s*```$/i, '')\n    .trim();\n\n  try { return JSON.parse(cleaned); } catch {}\n\n  const objMatch = cleaned.match(/\\{[\\s\\S]*\\}/);\n  if (objMatch) { try { return JSON.parse(objMatch[0]); } catch {} }\n\n  const fixed = cleaned.replace(/,\\s*([}\\]])/g, '$1');\n  try { return JSON.parse(fixed); } catch {}\n\n  const arrMatch = cleaned.match(/\\[[\\s\\S]*\\]/);\n  if (arrMatch) { try { return { selected_keywords: JSON.parse(arrMatch[0]) }; } catch {} }\n\n  throw new Error('Cannot parse LLM JSON. Raw snippet: ' + raw.slice(0, 400));\n}\n\nconst raw = $json?.message?.content\n  || $json?.output?.[0]?.content?.[0]?.text\n  || $json?.output?.[0]?.content\n  || $json?.choices?.[0]?.message?.content\n  || $json?.text\n  || '';\n\nif (!raw?.trim()) {\n  throw new Error('LLM Keyword Decision returned empty output. Check prompt and token limit.');\n}\n\nlet parsed;\ntry {\n  parsed = extractJson(raw);\n} catch(e) {\n  parsed = {\n    selected_keywords: [],\n    keyword_mapping_by_section: {},\n    selected_questions: [],\n    excluded_keywords: [],\n    search_intent: 'informational',\n    confidence_score: 30,\n    keyword_selection_reason: 'JSON parse failed — partial recovery applied.',\n    reason: 'Parse failure',\n    needs_review: true,\n    needs_review_reason: `LLM output JSON parse failed: ${e.message}`\n  };\n}\n\nif (!Array.isArray(parsed.selected_keywords))         parsed.selected_keywords = [];\nif (!Array.isArray(parsed.selected_questions))         parsed.selected_questions = [];\nif (!Array.isArray(parsed.excluded_keywords))          parsed.excluded_keywords = [];\nif (typeof parsed.keyword_mapping_by_section !== 'object' || Array.isArray(parsed.keyword_mapping_by_section))\n  parsed.keyword_mapping_by_section = {};\nif (typeof parsed.confidence_score !== 'number')       parsed.confidence_score = 50;\nparsed.confidence_score = Math.min(100, Math.max(0, Math.round(parsed.confidence_score)));\nif (typeof parsed.search_intent !== 'string')          parsed.search_intent = 'informational';\nparsed.keyword_selection_reason = (parsed.keyword_selection_reason || parsed.reason || '').trim();\nif (typeof parsed.needs_review !== 'boolean')          parsed.needs_review = false;\n\nparsed.selected_keywords = parsed.selected_keywords.map(kw => {\n  if (typeof kw === 'string') {\n    const match = allAvailableKeywords.find(k => k.keyword.toLowerCase() === kw.toLowerCase());\n    return { keyword: kw.trim(), search_volume: match?.search_volume ?? null, competition: match?.competition ?? null, cpc: match?.cpc ?? null, intent: match?.intent ?? 'informational', is_fallback: match?.is_fallback ?? false, relevance_reason: '' };\n  }\n  if (typeof kw === 'object' && kw !== null && typeof kw.keyword === 'string') {\n    return { keyword: kw.keyword.trim(), search_volume: typeof kw.search_volume === 'number' ? kw.search_volume : null, competition: kw.competition || null, cpc: typeof kw.cpc === 'number' ? kw.cpc : null, intent: kw.intent || 'informational', is_fallback: Boolean(kw.is_fallback), relevance_reason: (kw.relevance_reason || '').trim() };\n  }\n  return null;\n}).filter(Boolean);\n\nconst seen = new Set();\nparsed.selected_keywords = parsed.selected_keywords.filter(kw => {\n  const k = kw.keyword.toLowerCase();\n  if (seen.has(k)) return false;\n  seen.add(k);\n  return true;\n});\n\nconst forbidden = inputData.forbidden_topics || [];\nif (forbidden.length > 0) {\n  const beforeCount = parsed.selected_keywords.length;\n  parsed.selected_keywords = parsed.selected_keywords.filter(kw => {\n    const kwl = kw.keyword.toLowerCase();\n    return !forbidden.some(f => f && kwl.includes(f.toString().toLowerCase()));\n  });\n  const removed = beforeCount - parsed.selected_keywords.length;\n  if (removed > 0) parsed.keyword_selection_reason += ` [SYSTEM: ${removed} keyword(s) force-removed — matched forbidden topic.]`;\n}\n\nconst afterForbidden = parsed.selected_keywords.length;\nif (afterForbidden < minKw) {\n  const selectedSet = new Set(parsed.selected_keywords.map(k => k.keyword.toLowerCase()));\n  const forbiddenSet = new Set(forbidden.map(f => f.toString().toLowerCase()));\n  const candidates = allAvailableKeywords.filter(k => !selectedSet.has(k.keyword.toLowerCase())).filter(k => !forbiddenSet.has(k.keyword.toLowerCase())).sort((a, b) => { if (a.is_fallback !== b.is_fallback) return a.is_fallback ? 1 : -1; return (b.search_volume || 0) - (a.search_volume || 0); });\n  const needed = minKw - afterForbidden;\n  const backfilled = candidates.slice(0, needed).map(k => ({ ...k, relevance_reason: 'Auto-backfilled to meet minimum keyword requirement.' }));\n  parsed.selected_keywords = [...parsed.selected_keywords, ...backfilled];\n  if (backfilled.length > 0) parsed.keyword_selection_reason += ` [SYSTEM: ${backfilled.length} keyword(s) auto-backfilled to meet minimum of ${minKw}.]`;\n}\n\nconst finalCount = parsed.selected_keywords.length;\nconst withVolume = parsed.selected_keywords.filter(k => k.search_volume && k.search_volume > 0).length;\nconst fallbackCount = parsed.selected_keywords.filter(k => k.is_fallback).length;\nconst fallbackRatio = finalCount > 0 ? fallbackCount / finalCount : 1;\nconst realKeywordsAvailable = allAvailableKeywords.filter(k => !k.is_fallback).length;\n\nif (finalCount >= minKw) {\n  if (parsed.confidence_score < 80) { parsed.confidence_score = 80; parsed.keyword_selection_reason += ' [SYSTEM: Score raised to 80 — minimum keyword count met.]'; }\n} else {\n  parsed.confidence_score = Math.min(parsed.confidence_score, 72);\n}\n\nif (fallbackRatio > 0.6) {\n  if (realKeywordsAvailable === 0) { parsed.confidence_score = Math.min(parsed.confidence_score, 82); parsed.keyword_selection_reason += ' [SYSTEM: All keywords are fallback — DFS returned no data.]'; }\n  else { parsed.confidence_score = Math.min(parsed.confidence_score, 74); parsed.keyword_selection_reason += ' [SYSTEM: Score capped — majority of keywords are fallback despite real keywords being available.]'; }\n}\n\nif (withVolume >= 5 && parsed.confidence_score >= 80) parsed.confidence_score = Math.min(100, parsed.confidence_score + 3);\nparsed.confidence_score = Math.min(100, Math.max(0, Math.round(parsed.confidence_score)));\n\nif (inputData.section_type === 'accordion') {\n  const mapping = parsed.keyword_mapping_by_section;\n  const expectedKeys = ['overview.why_visit','overview.best_for','overview.where_to_stay','things_to_do.top_attractions','things_to_do.nature_and_outdoors','things_to_do.food_and_nightlife','trip_planning.best_time_to_visit','trip_planning.getting_around','trip_planning.budget_and_costs'];\n  const hasNestedFormat = expectedKeys.some(k => mapping[k] !== undefined);\n  if (!hasNestedFormat) {\n    const allSelected = parsed.selected_keywords.map(k => k.keyword);\n    const chunkSize = Math.ceil(allSelected.length / expectedKeys.length);\n    expectedKeys.forEach((key, i) => { mapping[key] = { keywords: allSelected.slice(i * chunkSize, (i + 1) * chunkSize), intent: 'informational' }; });\n    parsed.keyword_selection_reason += ' [SYSTEM: Accordion mapping auto-rebuilt from flat format.]';\n  }\n}\n\nconst paaCount = inputData.keyword_research?.people_also_ask?.length || 0;\nif (inputData.section_type === 'faq' && paaCount > 0 && parsed.selected_questions.length === 0) {\n  parsed.selected_questions = inputData.keyword_research.people_also_ask.slice(0, 5).map(q => typeof q === 'string' ? q : (q.question || q.title || '')).filter(Boolean);\n  parsed.keyword_selection_reason += ' [SYSTEM: FAQ questions auto-filled from People Also Ask data.]';\n}\n\nparsed.needs_review = parsed.confidence_score < 80;\nif (parsed.needs_review && !parsed.needs_review_reason) parsed.needs_review_reason = `Confidence score ${parsed.confidence_score} < 80.`;\nif (!parsed.needs_review) parsed.needs_review_reason = undefined;\n\nparsed._keyword_stats = {\n  total_available: totalAvailable,\n  real_keywords_available: realKeywordsAvailable,\n  min_required: minKw,\n  selected_count: finalCount,\n  with_volume: withVolume,\n  fallback_count: fallbackCount,\n  fallback_ratio: Math.round(fallbackRatio * 100) + '%',\n  auto_backfilled: finalCount - afterForbidden\n};\n\nreturn [{ json: { ...inputData, llm_decision: parsed, _phase: 'keywords_decided' } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4112, -1104],
+      "id": "d1ed863d-fa11-40a8-b195-929ad880bca5",
+      "name": "14 Parse + Validate Keyword Decision"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [-7520, -1200],
+      "id": "0f2efaf6-defc-4589-9bc2-dda46957bdc9",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {"conditions": {"options": {"caseSensitive": true,"leftValue": "","typeValidation": "strict","version": 2},"conditions": [{"leftValue": "={{ $json.llm_decision.confidence_score }}","rightValue": 80,"operator": {"type": "number","operation": "gte"},"id": "db87ec56-091f-42b5-8e7f-eb0e3cc0e958"}],"combinator": "and"},"renameOutput": true,"outputKey": "high_confidence"},
+            {"conditions": {"options": {"caseSensitive": true,"leftValue": "","typeValidation": "strict","version": 2},"conditions": [{"leftValue": "={{ $json.llm_decision.confidence_score }}","rightValue": 80,"operator": {"type": "number","operation": "lt"},"id": "ba5058b3-98c3-43dc-873d-a4602826b6ea"}],"combinator": "and"},"renameOutput": true,"outputKey": "low_confidence"}
+          ]
+        },
+        "options": {"fallbackOutput": "extra"}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [-3936, -1136],
+      "id": "384bdad9-ea35-4fa0-9e85-050ef7601541",
+      "name": "15 Confidence Score Router"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "YOUR_SPREADSHEET_NAME"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "YOUR_SHEET_GID",
+          "mode": "list",
+          "cachedResultName": "Content Requests"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $json.row_number }}",
+            "Status": "Needs Review",
+            "Needs Review Reason": "={{ $json.llm_decision.needs_review_reason || ('Confidence score too low: ' + $json.llm_decision.confidence_score) }}",
+            "Confidence Score": "={{ $json.llm_decision.confidence_score }}",
+            "Selected Keywords": "={{ JSON.stringify($json.llm_decision.selected_keywords) }}",
+            "Keyword Selection Reason": "={{ $json.llm_decision.keyword_selection_reason }}",
+            "Search Intent": "={{ $json.llm_decision.search_intent }}"
+          },
+          "matchingColumns": ["row_number"],
+          "schema": [
+            {"id": "row_number","displayName": "row_number","required": false,"defaultMatch": true,"display": true,"type": "number","canBeUsedToMatch": true,"readOnly": true,"removed": false},
+            {"id": "Status","displayName": "Status","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": false,"removed": false},
+            {"id": "Needs Review Reason","displayName": "Needs Review Reason","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": false,"removed": false},
+            {"id": "Confidence Score","displayName": "Confidence Score","required": false,"defaultMatch": false,"display": true,"type": "number","canBeUsedToMatch": false,"removed": false},
+            {"id": "Selected Keywords","displayName": "Selected Keywords","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": false,"removed": false},
+            {"id": "Keyword Selection Reason","displayName": "Keyword Selection Reason","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": false,"removed": false},
+            {"id": "Search Intent","displayName": "Search Intent","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": false,"removed": false}
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [-3552, -864],
+      "id": "bcaca581-5d69-460d-b580-c2072f8879f8",
+      "name": "16 Mark Needs Review (Low Confidence)",
+      "executeOnce": false,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d = $input.item.json;\nconst dec = d.llm_decision || {};\n\nconst selectedKws = (dec.selected_keywords || []).map(k => k.keyword);\nconst kwMapping   = dec.keyword_mapping_by_section || {};\nconst questions   = dec.selected_questions || [];\nconst keywordResearch = d.keyword_research || {};\n\nconst brief = {\n  topic_context:       d.topic_context,\n  target_audience:     d.target_audience,\n  content_goal:        d.content_goal,\n  section_type:        d.section_type,\n  word_count:          d.word_count,\n  language:            d.language,\n  language_code:       d.language_code,\n  country:             d.country,\n  search_intent:       dec.search_intent || 'informational',\n  selected_keywords:   selectedKws,\n  keyword_count:       selectedKws.length,\n  keyword_mapping:     kwMapping,\n  selected_questions:  questions,\n  people_also_ask:     keywordResearch.people_also_ask || [],\n  serp_organic:        keywordResearch.serp_organic || [],\n  top_competitors:     keywordResearch.top_competitors || [],\n  required_topics:     d.required_topics || [],\n  forbidden_topics:    d.forbidden_topics || [],\n  brand_voice:         d.brand_voice,\n  brand_voice_example: d.brand_voice_example,\n  output_format:       d.output_format,\n  existing_page_url:   d.existing_page_url || '',\n  existing_page_summary: d.existing_page_scraped ? d.existing_page_scraped.slice(0, 800) : 'Not provided.',\n  confidence_score:    dec.confidence_score,\n  keyword_selection_reason: dec.keyword_selection_reason || '',\n  research_summary: {\n    total_keywords: keywordResearch.total_count || 0,\n    question_keywords: (keywordResearch.question_keywords || []).length,\n    paa_count: (keywordResearch.people_also_ask || []).length,\n    competitor_count: (keywordResearch.top_competitors || []).length,\n    serp_result_count: (keywordResearch.serp_organic || []).length\n  }\n};\n\nreturn { json: { ...d, content_brief: brief, content_brief_text: JSON.stringify(brief, null, 2), _phase: 'brief_built' } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3600, -1152],
+      "id": "da0147fc-6ac1-4930-b58b-0e0cfce3bdb0",
+      "name": "17 Build Content Brief"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {"conditions": {"options": {"caseSensitive": true,"leftValue": "","typeValidation": "strict","version": 2},"conditions": [{"leftValue": "={{ $json.section_type }}","rightValue": "intro","operator": {"type": "string","operation": "equals"},"id": "eb7ec016-1030-4d99-b8d0-1921626222e9"}],"combinator": "and"},"renameOutput": true,"outputKey": "intro"},
+            {"conditions": {"options": {"caseSensitive": true,"leftValue": "","typeValidation": "strict","version": 2},"conditions": [{"leftValue": "={{ $json.section_type }}","rightValue": "accordion","operator": {"type": "string","operation": "equals"},"id": "16a3e552-cdbf-4de7-8d02-068c5552cd1f"}],"combinator": "and"},"renameOutput": true,"outputKey": "accordion"},
+            {"conditions": {"options": {"caseSensitive": true,"leftValue": "","typeValidation": "strict","version": 2},"conditions": [{"leftValue": "={{ $json.section_type }}","rightValue": "faq","operator": {"type": "string","operation": "equals"},"id": "50d8a042-4443-4243-b9d8-a3e0eb6c6083"}],"combinator": "and"},"renameOutput": true,"outputKey": "faq"},
+            {"conditions": {"options": {"caseSensitive": true,"leftValue": "","typeValidation": "strict","version": 2},"conditions": [{"leftValue": "={{ $json.section_type }}","rightValue": "comparison","operator": {"type": "string","operation": "equals"},"id": "414b0a87-d52b-430c-90cb-238a233f1632"}],"combinator": "and"},"renameOutput": true,"outputKey": "comparison"},
+            {"conditions": {"options": {"caseSensitive": true,"leftValue": "","typeValidation": "strict","version": 2},"conditions": [{"leftValue": "={{ $json.section_type }}","rightValue": "blog_post","operator": {"type": "string","operation": "equals"},"id": "c02e10c1-da77-463a-9938-83d02967f97a"}],"combinator": "and"},"renameOutput": true,"outputKey": "blog_post"}
+          ]
+        },
+        "options": {"fallbackOutput": "extra"}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [-3392, -1216],
+      "id": "21d435df-de20-4ba7-9dc2-600d780f7969",
+      "name": "18 Content Type Router"
+    },
+    {
+      "parameters": {
+        "modelId": {"__rl": true,"value": "gpt-4o","mode": "id"},
+        "responses": {"values": [{"content": "=={{ `\nYou are an experienced SEO travel content writer writing for Taya Tourism.\n\nYour task is to generate a high-quality SEO introduction section.\n\n════════════════════════════\nCONTENT CONTEXT\n════════════════════════════\n\nPrimary Keyword:\n${$json.primary_keyword}\n\nSection Type:\n${$json.section_type}\n\nLanguage:\n${$json.language}\n\nCountry:\n${$json.country}\n\nTarget Audience:\n${$json.target_audience}\n\nContent Goal:\n${$json.content_goal}\n\nWord Count Target:\n${$json.word_count}\n\nSearch Intent:\n${$json.llm_decision.search_intent}\n\n════════════════════════════\nSELECTED KEYWORDS\n════════════════════════════\n\n${($json.llm_decision.selected_keywords || []).map(k => `- ${k.keyword}`).join('\\n')}\n\n════════════════════════════\nREQUIRED TOPICS\n════════════════════════════\n\n${JSON.stringify($json.required_topics || [])}\n\n════════════════════════════\nFORBIDDEN TOPICS\n════════════════════════════\n\n${JSON.stringify($json.forbidden_topics || [])}\n\n════════════════════════════\nEXISTING PAGE CONTEXT\n════════════════════════════\n\n${$json.existing_page_scraped || 'Not provided'}\n\n════════════════════════════\nPEOPLE ALSO ASK\n════════════════════════════\n\n${JSON.stringify($json.content_brief?.people_also_ask || [])}\n\n════════════════════════════\nTOP COMPETITORS\n════════════════════════════\n\n${JSON.stringify($json.content_brief?.top_competitors || [])}\n\n════════════════════════════\nSERP INSIGHTS\n════════════════════════════\n\n${JSON.stringify($json.content_brief?.serp_organic || [])}\n\n════════════════════════════\nTAYA TOURISM BRAND VOICE\n════════════════════════════\n\nVoice: Professional, Clear, Trustworthy, Personal, Direct\n\nAvoid: dream getaway, paradise awaits, world-class, hidden gem, ultimate guide, exclusive deal\n\nWrite like an experienced travel advisor helping real travelers make practical decisions.\n\n════════════════════════════\nRULES\n════════════════════════════\n\n- Write ONLY the intro content\n- Naturally include selected keywords\n- Match the search intent\n- Avoid keyword stuffing\n- Avoid forbidden topics\n- Write in ${$json.language}\n- Keep content close to target word count: ${$json.word_count} words MINIMUM\n- Do NOT use markdown code blocks\n- Return ONLY the final intro content\n` }}"}]},
+        "builtInTools": {},
+        "options": {"maxTokens": 3000,"temperature": 0.3}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [-3040, -1632],
+      "id": "bfb239ef-ef75-4302-aaba-473fc69b011f",
+      "name": "19 Generate INTRO Content",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "modelId": {"__rl": true,"value": "gpt-4o","mode": "list","cachedResultName": "gpt-4o"},
+        "responses": {"values": [{"content": "=={{ `\nYou are an experienced SEO travel content writer writing for Taya Tourism.\n\nYour task is to generate structured ACCORDION content.\n\nPrimary Keyword: ${$json.primary_keyword}\nLanguage: ${$json.language}\nCountry: ${$json.country}\nTarget Audience: ${$json.target_audience}\nContent Goal: ${$json.content_goal}\nWord Count Target: ${$json.word_count}\nSearch Intent: ${$json.llm_decision.search_intent}\n\nKeyword Mapping:\n${JSON.stringify($json.llm_decision.keyword_mapping_by_section, null, 2)}\n\nSelected Keywords:\n${($json.llm_decision.selected_keywords || []).map(k => `- ${k.keyword}`).join('\\n')}\n\nRequired Topics: ${JSON.stringify($json.required_topics || [])}\nForbidden Topics: ${JSON.stringify($json.forbidden_topics || [])}\nExisting Page Context: ${$json.existing_page_scraped || 'Not provided'}\nPeople Also Ask: ${JSON.stringify($json.content_brief?.people_also_ask || [])}\nSERP Insights: ${JSON.stringify($json.content_brief?.serp_organic || [])}\n\nBrand Voice: Professional, Clear, Trustworthy, Personal, Direct\nAvoid: dream getaway, paradise awaits, world-class, hidden gem, ultimate guide, exclusive deal\n\nWord Count: ${$json.word_count} words MINIMUM. Write in ${$json.language}. Return ONLY valid JSON.\n\nREQUIRED OUTPUT FORMAT:\n{\n  \"overview\": {\n    \"why_visit\": { \"content\": \"\", \"keywords\": [], \"intent\": \"\" },\n    \"best_for\": { \"content\": \"\", \"keywords\": [], \"intent\": \"\" },\n    \"where_to_stay\": { \"content\": \"\", \"keywords\": [], \"intent\": \"\" }\n  },\n  \"things_to_do\": {\n    \"top_attractions\": { \"content\": \"\", \"keywords\": [], \"intent\": \"\" },\n    \"nature_and_outdoors\": { \"content\": \"\", \"keywords\": [], \"intent\": \"\" },\n    \"food_and_nightlife\": { \"content\": \"\", \"keywords\": [], \"intent\": \"\" }\n  },\n  \"trip_planning\": {\n    \"best_time_to_visit\": { \"content\": \"\", \"keywords\": [], \"intent\": \"\" },\n    \"getting_around\": { \"content\": \"\", \"keywords\": [], \"intent\": \"\" },\n    \"budget_and_costs\": { \"content\": \"\", \"keywords\": [], \"intent\": \"\" }\n  }\n}\n` }}"]},
+        "builtInTools": {},
+        "options": {"maxTokens": 3000,"textFormat": {"textOptions": {"type": "json_object"}},"temperature": 0.3}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [-3040, -1440],
+      "id": "32132879-ad7b-4554-9203-e39a3353cd72",
+      "name": "20 Generate ACCORDION Content",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "modelId": {"__rl": true,"value": "gpt-4o","mode": "list","cachedResultName": "gpt-4o"},
+        "responses": {"values": [{"content": "=={{ `\nYou are an experienced SEO travel content writer writing for Taya Tourism.\n\nYour task is to generate highly relevant FAQ content.\n\nPrimary Keyword: ${$json.primary_keyword}\nLanguage: ${$json.language}\nCountry: ${$json.country}\nTarget Audience: ${$json.target_audience}\nContent Goal: ${$json.content_goal}\nSearch Intent: ${$json.llm_decision.search_intent}\n\nSelected Keywords:\n${($json.llm_decision.selected_keywords || []).map(k => `- ${k.keyword}`).join('\\n')}\n\nSelected Questions:\n${($json.llm_decision.selected_questions || []).join('\\n')}\n\nPeople Also Ask:\n${($json.keyword_research?.people_also_ask || []).map(q => typeof q === 'string' ? `- ${q}` : `- ${q.question || q.title || ''}`).join('\\n')}\n\nRequired Topics: ${JSON.stringify($json.required_topics || [])}\nForbidden Topics: ${JSON.stringify($json.forbidden_topics || [])}\nExisting Page Context: ${$json.existing_page_scraped || 'Not provided'}\nSERP Insights: ${JSON.stringify($json.content_brief?.serp_organic || [])}\n\nBrand Voice: Professional, Clear, Trustworthy, Personal, Direct\nAvoid: dream getaway, paradise awaits, world-class, hidden gem, ultimate guide, exclusive deal\n\nWord Count: ${$json.word_count} words MINIMUM. Write in ${$json.language}. Return ONLY valid JSON.\n\nPrioritize Selected Questions. Use People Also Ask when useful.\nGenerate at least 5 FAQ items.\n\nOUTPUT FORMAT:\n[\n  { \"question\": \"\", \"answer\": \"\", \"keywords\": [], \"intent\": \"\" }\n]\n` }}"]},
+        "builtInTools": {},
+        "options": {"maxTokens": 3000,"textFormat": {"textOptions": {"type": "json_object"}},"temperature": 0.3}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [-3040, -1248],
+      "id": "71d6a6f1-fb10-42ec-825b-856302644800",
+      "name": "21 Generate FAQ Content",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "modelId": {"__rl": true,"value": "gpt-4o","mode": "list","cachedResultName": "gpt-4o"},
+        "responses": {"values": [{"content": "=={{ `\nYou are an experienced SEO travel content writer writing for Taya Tourism.\n\nYour task is to generate structured COMPARISON content.\n\nPrimary Keyword: ${$json.primary_keyword}\nLanguage: ${$json.language}\nCountry: ${$json.country}\nTarget Audience: ${$json.target_audience}\nContent Goal: ${$json.content_goal}\nWord Count Target: ${$json.word_count}\nSearch Intent: ${$json.llm_decision.search_intent}\n\nKeyword Mapping:\n${JSON.stringify($json.llm_decision.keyword_mapping_by_section, null, 2)}\n\nSelected Keywords:\n${($json.llm_decision.selected_keywords || []).map(k => `- ${k.keyword}`).join('\\n')}\n\nRequired Topics: ${JSON.stringify($json.required_topics || [])}\nForbidden Topics: ${JSON.stringify($json.forbidden_topics || [])}\nExisting Page Context: ${$json.existing_page_scraped || 'Not provided'}\nPeople Also Ask: ${JSON.stringify($json.content_brief?.people_also_ask || [])}\nSERP Insights: ${JSON.stringify($json.content_brief?.serp_organic || [])}\n\nBrand Voice: Professional, Clear, Trustworthy, Personal, Direct\nAvoid: dream getaway, paradise awaits, world-class, hidden gem, ultimate guide, exclusive deal\n\nWord Count: ${$json.word_count} words MINIMUM. Write in ${$json.language}. Return ONLY valid JSON.\nGenerate at least 5 comparison sections.\n\nOUTPUT FORMAT:\n{\n  \"title\": \"\",\n  \"intro\": \"\",\n  \"comparison_sections\": [\n    { \"topic\": \"\", \"comparison\": { \"option_a\": \"\", \"option_b\": \"\" }, \"keywords\": [], \"intent\": \"\" }\n  ],\n  \"conclusion\": \"\"\n}\n` }}"]},
+        "builtInTools": {},
+        "options": {"maxTokens": 5000,"textFormat": {"textOptions": {"type": "json_object"}},"temperature": 0.3}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [-3024, -1056],
+      "id": "9d24948a-d004-469f-a6b9-996252450a40",
+      "name": "22 Generate COMPARISON Content",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "modelId": {"__rl": true,"value": "gpt-4o","mode": "list","cachedResultName": "gpt-4o"},
+        "responses": {"values": [{"content": "=={{ `\nYou are an experienced SEO travel content writer writing for Taya Tourism.\n\nYour task is to generate a complete SEO blog post.\n\nPrimary Keyword: ${$json.primary_keyword}\nLanguage: ${$json.language}\nCountry: ${$json.country}\nTarget Audience: ${$json.target_audience}\nContent Goal: ${$json.content_goal}\nWord Count Target: ${$json.word_count}\nSearch Intent: ${$json.llm_decision.search_intent}\n\nKeyword Mapping:\n${JSON.stringify($json.llm_decision.keyword_mapping_by_section, null, 2)}\n\nSelected Keywords:\n${($json.llm_decision.selected_keywords || []).map(k => `- ${k.keyword}`).join('\\n')}\n\nSelected Questions:\n${($json.llm_decision.selected_questions || []).join('\\n')}\n\nPeople Also Ask: ${JSON.stringify($json.content_brief?.people_also_ask || [])}\nSERP Insights: ${JSON.stringify($json.content_brief?.serp_organic || [])}\nRequired Topics: ${JSON.stringify($json.required_topics || [])}\nForbidden Topics: ${JSON.stringify($json.forbidden_topics || [])}\nExisting Page Context: ${$json.existing_page_scraped || 'Not provided'}\n\nBrand Voice: Professional, Clear, Trustworthy, Personal, Direct, unforgettable\nAvoid: dream getaway, paradise awaits, world-class, hidden gem, ultimate guide, exclusive deal\n\nWord Count: ${$json.word_count} words MINIMUM. Write in ${$json.language}. Return ONLY valid JSON.\nGenerate at least 4 main sections. Use FAQ section for People Also Ask questions.\n\nCRITICAL: Do NOT stop writing until you reach ${$json.word_count} words.\n\nOUTPUT FORMAT:\n{\n  \"title\": \"\",\n  \"intro\": \"\",\n  \"sections\": [\n    { \"heading\": \"\", \"heading_level\": \"h2\", \"keywords\": [], \"content\": \"\" }\n  ],\n  \"faq\": [\n    { \"question\": \"\", \"answer\": \"\" }\n  ],\n  \"conclusion\": \"\",\n  \"meta_title\": \"\",\n  \"meta_description\": \"\",\n  \"suggested_slug\": \"\"\n}\n` }}"]},
+        "builtInTools": {},
+        "options": {"maxTokens": 4000,"textFormat": {"textOptions": {"type": "json_object"}},"temperature": 0.35}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [-3024, -848],
+      "id": "72003a88-0a90-4bda-b914-be327b349d16",
+      "name": "23 Generate BLOG POST Content",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const inputData = $('17 Build Content Brief').item.json;\n\nlet primarySearchVolume = 0;\ntry {\n  primarySearchVolume = $('09 DFS Related Keywords').item.json?.tasks?.[0]?.result?.[0]?.search_volume || 0;\n} catch(e) {}\n\nconst rawField = $json?.output?.[0]?.content?.[0]?.text;\nlet rawOutput = typeof rawField === 'object' && rawField !== null\n  ? JSON.stringify(rawField)\n  : (rawField ?? $json?.choices?.[0]?.message?.content ?? $json?.message?.content ?? $json?.content ?? '');\n\nif (!rawOutput) throw new Error(`Node 24: Empty output. Full json keys: ${Object.keys($json || {}).join(', ')}`);\n\nif (typeof rawOutput === 'object') {\n  try { rawOutput = JSON.stringify(rawOutput); } catch { rawOutput = String(rawOutput); }\n}\nrawOutput = String(rawOutput).trim();\nif (!rawOutput) throw new Error(`Content generation returned empty output for row ${inputData.row_number} (${inputData.section_type})`);\n\nfunction tryParseJson(raw) {\n  if (typeof raw !== 'string') raw = JSON.stringify(raw || '');\n  const cleaned = raw.trim().replace(/^```json\\s*/i,'').replace(/^```\\s*/i,'').replace(/\\s*```$/i,'').trim();\n  try { return JSON.parse(cleaned); } catch {}\n  const objM = cleaned.match(/\\{[\\s\\S]*\\}/);\n  if (objM) { try { return JSON.parse(objM[0]); } catch {} }\n  const arrM = cleaned.match(/\\[[\\s\\S]*\\]/);\n  if (arrM) { try { return JSON.parse(arrM[0]); } catch {} }\n  try { return JSON.parse(cleaned.replace(/,\\s*([}\\]])/g, '$1')); } catch {}\n  return null;\n}\n\nconst sectionType = inputData.section_type;\nconst outputFormat = inputData.output_format;\n\nlet parsedContent = null;\nlet finalOutput = '';\nlet metaTitle = '';\nlet metaDesc = '';\nlet suggestedSlug = '';\nlet parseError = null;\n\nif (['accordion','faq','comparison','blog_post'].includes(sectionType)) {\n  parsedContent = tryParseJson(rawOutput);\n  if (sectionType === 'faq' && parsedContent && !Array.isArray(parsedContent)) {\n    if (Array.isArray(parsedContent.faqs)) parsedContent = parsedContent.faqs;\n    else if (Array.isArray(parsedContent.questions)) parsedContent = parsedContent.questions;\n    else if (Array.isArray(parsedContent.faq)) parsedContent = parsedContent.faq;\n  }\n  if (sectionType === 'faq' && Array.isArray(parsedContent)) finalOutput = JSON.stringify(parsedContent, null, 2);\n  if (!parsedContent) { parseError = 'JSON parse failed — storing as raw text for review.'; parsedContent = { _raw: rawOutput, _parse_error: parseError }; }\n}\n\nswitch (outputFormat) {\n  case 'json': finalOutput = parsedContent ? JSON.stringify(parsedContent, null, 2) : rawOutput; break;\n  case 'markdown':\n    if (parsedContent && sectionType === 'blog_post') {\n      const p = parsedContent;\n      let md = `# ${p.title || inputData.primary_keyword}\\n\\n${p.intro || ''}\\n\\n`;\n      for (const s of (p.sections || [])) { const tag = s.heading_level === 'h3' ? '###' : '##'; md += `${tag} ${s.heading}\\n\\n${s.content}\\n\\n`; }\n      if ((p.faq || []).length > 0) { md += `## Frequently Asked Questions\\n\\n`; for (const q of p.faq) md += `### ${q.question}\\n\\n${q.answer}\\n\\n`; }\n      md += `${p.conclusion || ''}`; finalOutput = md.trim();\n    } else finalOutput = rawOutput;\n    break;\n  case 'html': case 'wordpress_html':\n    if (parsedContent && sectionType === 'blog_post') {\n      const p = parsedContent;\n      let html = `<h1>${p.title || inputData.primary_keyword}</h1>\\n<p>${p.intro || ''}</p>\\n`;\n      for (const s of (p.sections || [])) { const tag = s.heading_level || 'h2'; html += `<${tag}>${s.heading}</${tag}>\\n<p>${s.content}</p>\\n`; }\n      if ((p.faq || []).length > 0) { html += `<h2>Frequently Asked Questions</h2>\\n`; for (const q of p.faq) html += `<h3>${q.question}</h3>\\n<p>${q.answer}</p>\\n`; }\n      html += `<p>${p.conclusion || ''}</p>`; finalOutput = html.trim();\n    } else finalOutput = rawOutput;\n    break;\n  default: finalOutput = typeof parsedContent === 'object' && parsedContent ? JSON.stringify(parsedContent, null, 2) : rawOutput;\n}\n\nif (sectionType === 'blog_post' && parsedContent && !parsedContent._parse_error) {\n  metaTitle = parsedContent.meta_title || '';\n  metaDesc = parsedContent.meta_description || '';\n  suggestedSlug = parsedContent.suggested_slug || '';\n}\n\nreturn { json: { ...inputData, primary_search_volume: primarySearchVolume, generated_content: parsedContent, final_output: finalOutput, meta_title: metaTitle, meta_description: metaDesc, suggested_slug: suggestedSlug, _content_raw: rawOutput, _content_parse_error: parseError, _phase: 'content_generated' } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-2496, -1248],
+      "id": "dc814d91-f8b1-4f78-88d3-aefd461fab24",
+      "name": "24 Parse Generated Content (Universal)"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d = $input.item.json;\nconst failures = [];\nconst warnings = [];\n\nconst output    = d.final_output || '';\nconst section   = d.section_type;\nconst forbidden = d.forbidden_topics || [];\nconst keywords = (d.llm_decision?.selected_keywords || []).map(k => typeof k?.keyword === 'string' ? k.keyword.toLowerCase() : '').filter(Boolean);\n\nconst wordCount = output.split(/\\s+/).filter(Boolean).length;\nconst targetWC  = d.word_count || 300;\n\nif (!output || output.trim().length < 50) failures.push('Content is empty or too short (< 50 chars).');\n\nconst wcRatio = wordCount / targetWC;\nif (wcRatio < 0.15) failures.push(`Word count too low: ${wordCount} words (target: ${targetWC}, ratio: ${wcRatio.toFixed(2)}).`);\nelse if (wcRatio > 2.0) warnings.push(`Word count very high: ${wordCount} words (target: ${targetWC}).`);\n\nconst outputLower = output.toLowerCase();\nconst foundForbidden = forbidden.filter(f => f && outputLower.includes(f.toString().toLowerCase()));\nif (foundForbidden.length > 0) failures.push(`Forbidden topic(s) found in content: ${foundForbidden.join(', ')}.`);\n\nif (keywords.length > 0) {\n  const foundKws = keywords.filter(kw => outputLower.includes(kw));\n  const kwCoverage = foundKws.length / keywords.length;\n  if (kwCoverage < 0.10) failures.push(`Low keyword coverage: only ${foundKws.length}/${keywords.length} keywords found (${(kwCoverage*100).toFixed(0)}%).`);\n  else if (kwCoverage < 0.50) warnings.push(`Moderate keyword coverage: ${foundKws.length}/${keywords.length} (${(kwCoverage*100).toFixed(0)}%).`);\n}\n\nif (['accordion','faq','comparison','blog_post'].includes(section) && d._content_parse_error) failures.push(`JSON parse failed for ${section} section: ${d._content_parse_error}`);\n\nif (section === 'faq') {\n  const faqContent = d.generated_content;\n  if (Array.isArray(faqContent) && faqContent.length < 3) failures.push(`FAQ has fewer than 3 questions (found: ${faqContent.length}).`);\n  const paaCount = d.keyword_research?.people_also_ask?.length || 0;\n  if (paaCount > 0 && Array.isArray(faqContent) && faqContent.length === 0) failures.push('People Also Ask data was available but no FAQ items were generated.');\n}\n\nif (section === 'blog_post') {\n  const bp = d.generated_content;\n  if (bp && !bp._parse_error) {\n    if (!bp.title) warnings.push('Blog post missing title.');\n    if (!bp.meta_title) warnings.push('Blog post missing meta_title.');\n    if (!bp.meta_description) warnings.push('Blog post missing meta_description.');\n    if (!Array.isArray(bp.sections) || bp.sections.length < 2) failures.push('Blog post has fewer than 2 sections.');\n  }\n}\n\nif (d._content_parse_error) warnings.push(`Content parse issue: ${d._content_parse_error}`);\n\nconst preQcPassed = failures.length === 0;\nconst preQcSummary = [failures.length > 0 ? `FAILURES (${failures.length}): ${failures.join(' | ')}` : 'No failures.', warnings.length > 0 ? `WARNINGS (${warnings.length}): ${warnings.join(' | ')}` : ''].filter(Boolean).join(' /// ');\n\nreturn { json: { ...d, pre_qc: { passed: preQcPassed, failures, warnings, summary: preQcSummary, word_count_actual: wordCount }, _phase: 'pre_qc_done' } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-2320, -1248],
+      "id": "a3d64fb0-f088-436a-ad3f-b1ca9306fbe6",
+      "name": "24b Deterministic Pre-QC"
+    },
+    {
+      "parameters": {
+        "modelId": {"__rl": true,"value": "gpt-4o","mode": "list","cachedResultName": "gpt-4o"},
+        "responses": {"values": [{"content": "=={{ `\nYou are an experienced SEO editor evaluating production-ready content quality.\n\nReturn ONLY valid JSON.\n\nPrimary Keyword: ${$json.primary_keyword || ''}\nSection Type: ${$json.section_type || ''}\nTarget Audience: ${$json.target_audience || ''}\nContent Goal: ${$json.content_goal || ''}\nLanguage: ${$json.language || 'English'}\nWord Count Target: ${$json.word_count || 300}\nWord Count Actual: ${$json.pre_qc?.word_count_actual || 0}\nBrand Voice: ${$json.brand_voice || ''}\n\nSelected Keywords: ${(($json.llm_decision?.selected_keywords) || []).map(k => k.keyword || k).join(', ')}\nSearch Intent: ${$json.llm_decision?.search_intent || 'informational'}\nRequired Topics: ${JSON.stringify($json.required_topics || [])}\nForbidden Topics: ${JSON.stringify($json.forbidden_topics || [])}\n\nPre-QC Passed: ${$json.pre_qc?.passed ?? false}\nFailures: ${JSON.stringify($json.pre_qc?.failures || [])}\nWarnings: ${JSON.stringify($json.pre_qc?.warnings || [])}\n\nCONTENT TO REVIEW:\n${$json.final_output || ''}\n\nSCORING: 9-10=excellent, 7-8=good, 5-6=acceptable, 0-4=major problems\nquality_passed = true if overall_score >= 7.0\nrecommended_action: approve(>=8), revise(5-7.9), reject(<5)\n\nReturn ONLY:\n{\n  \"scores\": { \"keyword_usage\": 0, \"search_intent_match\": 0, \"content_depth\": 0, \"structure_readability\": 0, \"brand_voice_alignment\": 0, \"forbidden_topic_compliance\": 0, \"word_count_appropriateness\": 0, \"uniqueness_value\": 0, \"cta_engagement\": 0, \"technical_seo\": 0 },\n  \"overall_score\": 0,\n  \"quality_passed\": false,\n  \"top_issues\": [],\n  \"quick_wins\": [],\n  \"keyword_coverage_feedback\": \"\",\n  \"brand_voice_feedback\": \"\",\n  \"content_summary\": \"\",\n  \"recommended_action\": \"approve\",\n  \"revision_notes\": \"\"\n}\n` }}"]},
+        "simplify": false,
+        "builtInTools": {},
+        "options": {"maxTokens": 1500,"temperature": 0.1}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [-2112, -1248],
+      "id": "f1bad8b7-5c14-443f-ac95-0e70e0803e8d",
+      "name": "25 Quality Check (10-Point Audit)",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const inputData = $('24b Deterministic Pre-QC').item.json;\n\nconst rawQc = $json?.output?.[0]?.content?.[0]?.text || $json?.output?.[0]?.content || $json?.message?.content || $json?.choices?.[0]?.message?.content || '';\n\nfunction tryParse(raw) {\n  if (!raw || typeof raw !== 'string') return null;\n  const cleaned = raw.trim().replace(/^```json\\s*/i,'').replace(/^```\\s*/i,'').replace(/\\s*```$/i,'').trim();\n  try { return JSON.parse(cleaned); } catch {}\n  const match = cleaned.match(/\\{[\\s\\S]*\\}/);\n  if (match) { try { return JSON.parse(match[0]); } catch {} }\n  try { return JSON.parse(cleaned.replace(/,\\s*([}\\]])/g, '$1')); } catch {}\n  return null;\n}\n\nlet qcResult = tryParse(rawQc);\nif (!qcResult) qcResult = { scores: {}, overall_score: 50, quality_passed: false, top_issues: ['QC parse failed'], quick_wins: [], keyword_coverage_feedback: '', brand_voice_feedback: '', content_summary: '', recommended_action: 'review', revision_notes: 'LLM QC output could not be parsed.' };\n\nif (typeof qcResult.overall_score !== 'number') qcResult.overall_score = 50;\nqcResult.overall_score = Math.max(0, Math.min(10, qcResult.overall_score));\nif (typeof qcResult.quality_passed !== 'boolean') qcResult.quality_passed = qcResult.overall_score >= 7;\nif (!Array.isArray(qcResult.top_issues)) qcResult.top_issues = [];\nif (!Array.isArray(qcResult.quick_wins)) qcResult.quick_wins = [];\n\nconst preQc = inputData.pre_qc || {};\nif (!preQc.passed) { qcResult.quality_passed = false; qcResult.top_issues = [...qcResult.top_issues, ...(preQc.failures || [])]; }\n\nconst finalStatus = qcResult.quality_passed ? 'Done' : 'Needs Review';\n\nconst qcSummary = [`Overall Score: ${qcResult.overall_score}/10`, `Status: ${qcResult.quality_passed ? 'PASSED' : 'FAILED'}`, qcResult.top_issues.length ? `Issues: ${qcResult.top_issues.join('; ')}` : 'No major issues detected.', qcResult.content_summary || ''].join(' | ');\n\nconst metaTitle = inputData.meta_title || `${inputData.primary_keyword} | ${inputData.content_goal}`;\nconst metaDesc = inputData.meta_description || `${(inputData.topic_context || '').slice(0, 140)}...`;\nconst slug = inputData.suggested_slug || inputData.primary_keyword.toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');\n\nreturn { json: { ...inputData, qc_result: qcResult, quality_check_text: qcSummary, final_status: finalStatus, meta_title: metaTitle, meta_description: metaDesc, suggested_slug: slug, needs_review: !qcResult.quality_passed, needs_review_reason: qcResult.top_issues.join(' | ') || '', _phase: 'qc_complete' } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1776, -1248],
+      "id": "83899507-e062-4b58-b29f-8e77c1a38c2a",
+      "name": "26 Parse Quality Check + Build Output"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true,"leftValue": "","typeValidation": "strict","version": 3},
+          "conditions": [{"id": "7f125baa-8077-4bb3-9a38-f24b146aacfc","leftValue": "={{$json.final_status}}","rightValue": "Done","operator": {"type": "string","operation": "equals","name": "filter.operator.equals"}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [-1328, -1328],
+      "id": "ed764d4e-9447-4813-acd2-f63e03e33eb9",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "YOUR_SPREADSHEET_NAME"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "YOUR_SHEET_GID",
+          "mode": "list",
+          "cachedResultName": "Content Requests"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $json.row_number }}",
+            "Status": "={{ $json.final_status }}",
+            "Selected Keywords": "={{ JSON.stringify($json.llm_decision.selected_keywords) }}",
+            "Keyword Mapping by Section": "={{ JSON.stringify($json.llm_decision.keyword_mapping_by_section) }}",
+            "Excluded Keywords": "={{ JSON.stringify($json.llm_decision.excluded_keywords) }}",
+            "Search Intent": "={{ $json.llm_decision.search_intent }}",
+            "Confidence Score": "={{ $json.llm_decision.confidence_score }}",
+            "Keyword Selection Reason": "={{ $json.llm_decision.keyword_selection_reason }}",
+            "Content Brief": "={{ $json.content_brief_text }}",
+            "Final Output": "={{ $json.final_output }}",
+            "Meta Title": "={{ $json.meta_title }}",
+            "Meta Description": "={{ $json.meta_description }}",
+            "Suggested Slug": "={{ $json.suggested_slug }}",
+            "Quality Check Result": "={{ $json.quality_check_text }}",
+            "Needs Review Reason": "={{ $json.needs_review_reason }}"
+          },
+          "matchingColumns": ["row_number"],
+          "schema": [
+            {"id": "Primary Keyword","displayName": "Primary Keyword","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Page Type","displayName": "Page Type","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Section Type","displayName": "Section Type","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Word Count","displayName": "Word Count","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Keyword Count","displayName": "Keyword Count","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Min Keywords Required","displayName": "Min Keywords Required","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Language","displayName": "Language","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Country / Location","displayName": "Country / Location","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Topic Context","displayName": "Topic Context","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Target Audience","displayName": "Target Audience","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Content Goal","displayName": "Content Goal","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Required Topics","displayName": "Required Topics","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Forbidden Topics","displayName": "Forbidden Topics","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Brand Voice","displayName": "Brand Voice","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Brand Voice Example","displayName": "Brand Voice Example","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Output Format","displayName": "Output Format","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Existing Page URL","displayName": "Existing Page URL","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Existing Page Content / Summary","displayName": "Existing Page Content / Summary","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": true},
+            {"id": "Status","displayName": "Status","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Selected Keywords","displayName": "Selected Keywords","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Keyword Mapping by Section","displayName": "Keyword Mapping by Section","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Excluded Keywords","displayName": "Excluded Keywords","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Search Intent","displayName": "Search Intent","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Confidence Score","displayName": "Confidence Score","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Keyword Selection Reason","displayName": "Keyword Selection Reason","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Content Brief","displayName": "Content Brief","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Final Output","displayName": "Final Output","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Meta Title","displayName": "Meta Title","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Meta Description","displayName": "Meta Description","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Suggested Slug","displayName": "Suggested Slug","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Quality Check Result","displayName": "Quality Check Result","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "Needs Review Reason","displayName": "Needs Review Reason","required": false,"defaultMatch": false,"display": true,"type": "string","canBeUsedToMatch": true,"removed": false},
+            {"id": "row_number","displayName": "row_number","required": false,"defaultMatch": false,"display": true,"type": "number","canBeUsedToMatch": true,"readOnly": true,"removed": false}
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [-608, -1872],
+      "id": "a87853cd-e6ad-4cf2-aed3-9a1453af2044",
+      "name": "27 Update Output in Google Sheets",
+      "executeOnce": false,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-8432, -1168],
+      "id": "8012dfb2-fffe-4055-aefe-4e266b67ce88",
+      "name": "When clicking 'Execute workflow'"
+    }
+  ],
+  "connections": {
+    "00 Schedule Trigger": {"main": [[{"node": "00b Concurrency Guard","type": "main","index": 0}]]},
+    "00b Concurrency Guard": {"main": [[{"node": "01 Read Pending Rows","type": "main","index": 0}]]},
+    "01 Read Pending Rows": {"main": [[{"node": "Loop Over Items","type": "main","index": 0}]]},
+    "02 Has Valid Row?": {"main": [[{"node": "03 Normalize + Validate Input","type": "main","index": 0}]]},
+    "03 Normalize + Validate Input": {"main": [[{"node": "04 Mark Processing","type": "main","index": 0}]]},
+    "04 Mark Processing": {"main": [[{"node": "04b Restore After Mark","type": "main","index": 0}]]},
+    "04b Restore After Mark": {"main": [[{"node": "05 Has Existing Page URL?","type": "main","index": 0}]]},
+    "05 Has Existing Page URL?": {"main": [[{"node": "06 Fetch Existing Page","type": "main","index": 0}],[{"node": "05b No URL — Use Existing Text","type": "main","index": 0}]]},
+    "06 Fetch Existing Page": {"main": [[{"node": "07 Extract Page Text","type": "main","index": 0}]]},
+    "07 Extract Page Text": {"main": [[{"node": "08 Merge URL Branches","type": "main","index": 0}]]},
+    "05b No URL — Use Existing Text": {"main": [[{"node": "08 Merge URL Branches","type": "main","index": 1}]]},
+    "08 Merge URL Branches": {"main": [[{"node": "09 DFS Related Keywords","type": "main","index": 0},{"node": "If1","type": "main","index": 0}]]},
+    "09 DFS Related Keywords": {"main": [[{"node": "Merge","type": "main","index": 0}]]},
+    "12 Aggregate + Cluster + Fallback": {"main": [[{"node": "13 LLM Keyword Decision + Deep Mapping","type": "main","index": 0}]]},
+    "13 LLM Keyword Decision + Deep Mapping": {"main": [[{"node": "14 Parse + Validate Keyword Decision","type": "main","index": 0}]]},
+    "14 Parse + Validate Keyword Decision": {"main": [[{"node": "15 Confidence Score Router","type": "main","index": 0}]]},
+    "Loop Over Items": {"main": [[],[{"node": "02 Has Valid Row?","type": "main","index": 0}]]},
+    "27 Update Output in Google Sheets": {"main": [[{"node": "Loop Over Items","type": "main","index": 0}]]},
+    "26 Parse Quality Check + Build Output": {"main": [[{"node": "If","type": "main","index": 0}]]},
+    "25 Quality Check (10-Point Audit)": {"main": [[{"node": "26 Parse Quality Check + Build Output","type": "main","index": 0}]]},
+    "24b Deterministic Pre-QC": {"main": [[{"node": "25 Quality Check (10-Point Audit)","type": "main","index": 0}]]},
+    "24 Parse Generated Content (Universal)": {"main": [[{"node": "24b Deterministic Pre-QC","type": "main","index": 0}]]},
+    "23 Generate BLOG POST Content": {"main": [[{"node": "24 Parse Generated Content (Universal)","type": "main","index": 0}]]},
+    "22 Generate COMPARISON Content": {"main": [[{"node": "24 Parse Generated Content (Universal)","type": "main","index": 0}]]},
+    "21 Generate FAQ Content": {"main": [[{"node": "24 Parse Generated Content (Universal)","type": "main","index": 0}]]},
+    "20 Generate ACCORDION Content": {"main": [[{"node": "24 Parse Generated Content (Universal)","type": "main","index": 0}]]},
+    "19 Generate INTRO Content": {"main": [[{"node": "24 Parse Generated Content (Universal)","type": "main","index": 0}]]},
+    "18 Content Type Router": {"main": [[{"node": "19 Generate INTRO Content","type": "main","index": 0}],[{"node": "20 Generate ACCORDION Content","type": "main","index": 0}],[{"node": "21 Generate FAQ Content","type": "main","index": 0}],[{"node": "22 Generate COMPARISON Content","type": "main","index": 0}],[{"node": "23 Generate BLOG POST Content","type": "main","index": 0}]]},
+    "17 Build Content Brief": {"main": [[{"node": "18 Content Type Router","type": "main","index": 0}]]},
+    "15 Confidence Score Router": {"main": [[{"node": "17 Build Content Brief","type": "main","index": 0}],[{"node": "16 Mark Needs Review (Low Confidence)","type": "main","index": 0}]]},
+    "If": {"main": [[{"node": "27 Update Output in Google Sheets","type": "main","index": 0}],[{"node": "27 Update Output in Google Sheets","type": "main","index": 0}]]},
+    "16 Mark Needs Review (Low Confidence)": {"main": [[{"node": "Loop Over Items","type": "main","index": 0}]]},
+    "When clicking 'Execute workflow'": {"main": [[{"node": "00b Concurrency Guard","type": "main","index": 0}]]},
+    "If1": {"main": [[{"node": "11 DFS SERP + PAA","type": "main","index": 0}]]},
+    "11 DFS SERP + PAA": {"main": [[{"node": "11b Parse SERP","type": "main","index": 0}]]},
+    "Merge": {"main": [[{"node": "12 Aggregate + Cluster + Fallback","type": "main","index": 0}]]},
+    "11b Parse SERP": {"main": [[{"node": "Merge","type": "main","index": 1}]]}
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "YOUR_N8N_INSTANCE_ID"
+  }
+}
