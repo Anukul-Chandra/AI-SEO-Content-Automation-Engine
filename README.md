@@ -1,5 +1,8 @@
 # 🚀 AI SEO Content Automation Engine
 
+<img width="1088" height="226" alt="2026-06-11_20-22-47" src="https://github.com/user-attachments/assets/cda1d1e6-f6d2-46f3-a14a-8e386aff1ffe" />
+
+
 ## Overview
 
 An enterprise-grade AI content production system built with n8n, OpenAI GPT-4o, DataForSEO, and Google Sheets.
